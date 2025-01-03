@@ -28,12 +28,14 @@ public final class Arc<T> implements AutoCloseable {
 
     private final ArcPool<T> sourcePool;
     private final Node<Arc<T>> node;  // Reference to this Arc's node for reuse
+    private final long allConsumerMask;
     private volatile int refCount; // Accessed using varHandle
     private T value;
 
-    private Arc(Node<Arc<T>> node, ArcPool<T> sourcePool) {
+    private Arc(Node<Arc<T>> node, ArcPool<T> sourcePool, long allConsumerMask) {
         this.node = node;
         this.sourcePool = sourcePool;
+        this.allConsumerMask = allConsumerMask;
         this.refCount = 0;
     }
 
@@ -90,20 +92,44 @@ public final class Arc<T> implements AutoCloseable {
         }
     }
 
+    public static class AccessDeniedException extends SecurityException {
+        public AccessDeniedException() {
+            super("Consumer does not have access to this Arc");
+        }
+    }
+
     public static final class ArcPool<T> {
         private static final ConcurrentHashMap<String, ArcPool<?>> POOLS = new ConcurrentHashMap<>();
         private final AtomicReference<Node<Arc<T>>> poolHead;
         private final AtomicInteger poolSize;
         private final Supplier<T> factory;
         private final int maxPoolSize;
-        private AtomicLong consumerMask;
+        private final AtomicLong allConsumerMask;
+
+        @SuppressWarnings("unchecked")
+        public static <V> ArcPool<V> getOrCreateNamedPool(String poolName, Supplier<V> factory, int maxPoolSize) {
+            return (ArcPool<V>) POOLS.computeIfAbsent(poolName, k -> new ArcPool<>(factory, maxPoolSize));
+        }
 
         public ArcPool(Supplier<T> factory, int maxPoolSize) {
             this.factory = factory;
             this.maxPoolSize = maxPoolSize;
             this.poolHead = new AtomicReference<>(null);
             this.poolSize = new AtomicInteger(0);
-            this.consumerMask = new AtomicLong(0);
+            this.allConsumerMask = new AtomicLong(0);
+        }
+
+        public static long findNextWithDifferentLeftmostBit(long v1) {
+            if (v1 == 0) return 1;  // Special case for 0
+
+            // Find the position of leftmost set bit
+            int leftmostBitPos = 63 - Long.numberOfLeadingZeros(v1);
+
+            // Create a mask with all 1s up to leftmostBitPos
+            long mask = (1L << (leftmostBitPos + 1)) - 1;
+
+            // Clear all bits from leftmostBitPos and set the next bit
+            return (v1 & ~mask) | (1L << (leftmostBitPos + 1));
         }
 
         public int getPoolSize() {
@@ -121,7 +147,7 @@ public final class Arc<T> implements AutoCloseable {
                 }
             } else {
                 node = new Node<>();
-                arc = new Arc<>(node, this);
+                arc = new Arc<>(node, this, allConsumerMask.get());
                 arc.value = factory.get();
                 node.value = arc;
             }
@@ -167,29 +193,31 @@ public final class Arc<T> implements AutoCloseable {
             return oldHead;
         }
 
-        public long registerConsumer() {
+        public ConsumerToken<T> registerConsumer() {
             long oldMask;
-            long consumerBit;
+            long consumerBitIndex;
             long newMask;
             do {
-                oldMask = consumerMask.get();
-                consumerBit = findNextWithDifferentLeftmostBit(oldMask);
-                newMask = oldMask | consumerBit;
-            } while (!consumerMask.compareAndSet(oldMask, newMask));
-            return consumerBit;
+                oldMask = allConsumerMask.get();
+                consumerBitIndex = findNextWithDifferentLeftmostBit(oldMask);
+                newMask = oldMask | consumerBitIndex;
+            } while (!allConsumerMask.compareAndSet(oldMask, newMask));
+            return new ConsumerToken<>((1L << consumerBitIndex));
+        }
+    }
+
+    public static class ConsumerToken<T> {
+        private final long consumerMask;
+
+        public ConsumerToken(long consumerMask) {
+            this.consumerMask = consumerMask;
         }
 
-        public static long findNextWithDifferentLeftmostBit(long v1) {
-            if (v1 == 0) return 1;  // Special case for 0
-
-            // Find the position of leftmost set bit
-            int leftmostBitPos = 63 - Long.numberOfLeadingZeros(v1);
-
-            // Create a mask with all 1s up to leftmostBitPos
-            long mask = (1L << (leftmostBitPos + 1)) - 1;
-
-            // Clear all bits from leftmostBitPos and set the next bit
-            return (v1 & ~mask) | (1L << (leftmostBitPos + 1));
+        public Arc<T> checkAccess(Arc<T> arc) {
+            if ((arc.allConsumerMask & consumerMask) == 0) {
+                throw new AccessDeniedException();
+            }
+            return arc;
         }
     }
 
